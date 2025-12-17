@@ -1,10 +1,11 @@
 use bincode::{Decode, Encode, config};
-use std::process::Stdio;
-use tokio::{
+use std::{
     fs,
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
-    process::Command,
+    process::{Command, Stdio},
+    sync::{Arc, Mutex},
+    thread,
 };
 use uuid::Uuid;
 
@@ -26,129 +27,135 @@ enum HandlerError {
     #[error("Failed to listen on port: {port}")]
     ListenerError { port: u16 },
 
-    #[error("File system error: {0}")]
-    IoError(#[from] tokio::io::Error),
+    #[error("I/O error: {0}")]
+    IoError(#[from] std::io::Error),
 
     #[error("Failed to decode: {0}")]
     DecodeError(#[from] bincode::error::DecodeError),
 
-    #[error("Failed to encode: {0}")]
-    EncodeError(#[from] bincode::error::EncodeError),
+    #[error("Failed to establish pipe: {0}")]
+    PipError(#[from] nix::errno::Errno),
 
-    #[error("Failed to spawn task")]
-    SpawnError(#[from] tokio::task::JoinError),
-
-    #[error("Failed to connect to child I/O")]
-    ProcessIOError,
+    // #[error("Thread join error: {0}")]
+    // ThreadJoinError(String),
 }
 
-#[tokio::main]
-async fn main() {
-    listen_to_port(8000).await.expect("Failed");
+fn main() -> Result<(), HandlerError> {
+    listen_to_port(8000)
 }
 
-async fn listen_to_port(port: u16) -> Result<(), HandlerError> {
-    let address = format!("127.0.0.1:{port}");
-    let listener = TcpListener::bind(address)
-        .await
-        .map_err(|_| HandlerError::ListenerError { port })?;
+fn listen_to_port(port: u16) -> Result<(), HandlerError> {
+    let address = format!("0.0.0.0:{port}");
+    let listener = TcpListener::bind(&address).map_err(|_| HandlerError::ListenerError { port })?;
 
-    loop {
-        let (stream, _) = listener.accept().await?;
+    println!("Listening on {address}...");
 
-        tokio::spawn(async move {
-            handle_request(stream).await.expect("Failed to handle request");
-        });
-    }
-}
-
-async fn handle_request(mut stream: TcpStream) -> Result<(), HandlerError> {
-
-    let message = read_content_from_stream(&mut stream).await?;
-    handle_message(message, stream)
-        .await?;
-
-    Ok(())
-}
-
-async fn handle_message(message: Message, mut stream: TcpStream) -> Result<(), HandlerError> {
-    let uuid = Uuid::new_v4();
-    let dir_path = format!("temp/{}", uuid.to_string());
-
-    fs::create_dir(&dir_path).await?;
-    let path = format!("{}/script.js", &dir_path);
-
-    fs::write(&path, message.code.as_bytes()).await?;
-
-    let mut child = Command::new("node")
-        .arg(path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| HandlerError::ProcessIOError)?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| HandlerError::ProcessIOError)?;
-
-    let mut stdout_reader = BufReader::new(stdout).lines();
-    let mut stderr_reader = BufReader::new(stderr).lines();
-
-    let mut stdout_open = true;
-    let mut stderr_open = true;
-
-    loop {
-        tokio::select! {
-            stdout_line_result = stdout_reader.next_line() => {
-                let stdout_line = stdout_line_result?;
-                match stdout_line {
-                    Some(line) => {
-                        let output = format!("{line}\n");
-                        stream.write(output.as_bytes()).await?;
-                        stream.flush().await?;
-                    }
-                    None => {
-                        stdout_open = false;
-                    }
-                }
+    for stream_res in listener.incoming() {
+        match stream_res {
+            Ok(stream) => {
+                handle_request(stream)?;
             }
-            stderr_line_result = stderr_reader.next_line() => {
-                let stderr_line = stderr_line_result?;
-                match stderr_line {
-                    Some(line) => {
-                        let output = format!("{line}\n");
-                        stream.write(output.as_bytes()).await?;
-                        stream.flush().await?;
-                    }
-                    None => {
-                        stderr_open = false;
-                    }
-                }
-            }
-            status = child.wait(), if !stdout_open && !stderr_open => {
-                let exit_status = status?;
-                println!("Child process exited with final status: {}", exit_status);
-                break;
+            Err(e) => {
+                eprintln!("Accept error: {}", e);
             }
         }
     }
-    fs::remove_dir_all(dir_path).await?;
 
     Ok(())
 }
 
-async fn read_content_from_stream(stream: &mut TcpStream) -> Result<Message, HandlerError> {
+fn handle_request(mut stream: TcpStream) -> Result<(), HandlerError> {
+    let message = read_content_from_stream(&mut stream)?;
+    handle_message(message, stream)?;
+
+    Ok(())
+}
+
+fn handle_message(message: Message, stream: TcpStream) -> Result<(), HandlerError> {
+    let uuid = Uuid::new_v4();
+    let work_dir = format!("sandbox/tmp/executions/{uuid}");
+    fs::create_dir_all(&work_dir)?;
+
+    let script_path = format!("{work_dir}/script.js");
+    fs::write(&script_path, message.code)?;
+
+    let mut child = Command::new("bwrap")
+    .args([
+        "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/lib", "/lib",
+        "--ro-bind", "/lib64", "/lib64",
+        "--ro-bind", "/bin", "/bin",
+
+        "--bind", &work_dir, "/exec",
+
+        "--tmpfs", "/tmp",
+        "--proc", "/proc",
+        "--dev", "/dev",
+
+        // "--unshare-pid",
+        // "--unshare-net",
+        "--die-with-parent",
+
+        "/usr/bin/node",
+        "/exec/script.js",
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()?;
+
+
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+
+    let shared_stream = Arc::new(Mutex::new(stream));
+
+    // stdout thread
+    let out_stream = Arc::clone(&shared_stream);
+    let out_handle = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            if let Ok(l) = line {
+                let mut s = out_stream.lock().unwrap();
+                let _ = writeln!(s, "{l}");
+            }
+        }
+    });
+    
+    // stderr thread
+    let err_stream = Arc::clone(&shared_stream);
+    let err_handle = thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            if let Ok(l) = line {
+                let mut s = err_stream.lock().unwrap();
+                let _ = writeln!(s, "{l}");
+            }
+        }
+    });
+
+    let status = child.wait()?;
+    let _ = out_handle.join();
+    let _ = err_handle.join();
+
+    writeln!(
+        shared_stream.lock().unwrap(),
+        "Process exited with status: {status}"
+    )?;
+
+    fs::remove_dir_all(&work_dir)?;
+
+    Ok(())
+}
+
+fn read_content_from_stream(stream: &mut TcpStream) -> Result<Message, HandlerError> {
     let mut content_length_buffer = [0u8; 4];
-    stream.read_exact(&mut content_length_buffer).await?;
+    stream.read_exact(&mut content_length_buffer)?;
 
     let content_length = u32::from_ne_bytes(content_length_buffer);
 
     let mut message_buffer = vec![0u8; content_length as usize];
-    stream.read_exact(&mut message_buffer).await?;
+    stream.read_exact(&mut message_buffer)?;
 
     let (message, _message_length): (Message, usize) =
         bincode::decode_from_slice(&message_buffer[..], config::standard())?;
