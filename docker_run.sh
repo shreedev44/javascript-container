@@ -1,9 +1,10 @@
 #!/bin/bash
 
 docker run \
+  --read-only \
   --rm \
   -p 8000:8000 \
-  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=128m \
   --memory=256m \
   --pids-limit=64 \
   --cpus=0.5 \

@@ -70,9 +70,10 @@ fn handle_request(mut stream: TcpStream) -> Result<(), HandlerError> {
 
 fn handle_message(message: Message, stream: TcpStream) -> Result<(), HandlerError> {
     let uuid = Uuid::new_v4();
-    let work_dir = format!("sandbox/tmp/executions/{uuid}");
+    let work_dir = format!("/tmp/executions/{uuid}");
+    
     fs::create_dir_all(&work_dir)?;
-
+    
     let script_path = format!("{work_dir}/script.js");
     fs::write(&script_path, message.code)?;
 

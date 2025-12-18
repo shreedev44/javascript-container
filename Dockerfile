@@ -1,30 +1,23 @@
-FROM debian:bookworm-slim AS builder
+FROM alpine:3.20
 
-RUN apt-get update && apt-get install -y \
-    curl \
-    build-essential \
-    pkg-config \
-    libssl-dev \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
-ENV PATH="/root/.cargo/bin:$PATH"
-
-WORKDIR /build
-COPY . .
-RUN cargo build --release
-
-# ---- Runtime ----
-FROM debian:bookworm-slim
-
-RUN apt-get update && apt-get install -y \
+RUN apk add --no-cache \
     nodejs \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    ca-certificates
 
+# ---- Create non-root user ----
+RUN adduser -D -u 10001 executor
+
+RUN chmod 1777 /tmp
+
+# ---- App directory (read-only at runtime) ----
 WORKDIR /app
-COPY --from=builder /build/target/release/container_agent /app/executor
+COPY target/x86_64-unknown-linux-musl/release/container_agent /app/executor
+
+RUN chmod +x /app/executor \
+    && chown executor:executor /app/executor
+
+USER executor
 
 EXPOSE 8000
+
 ENTRYPOINT ["/app/executor"]
