@@ -32,9 +32,6 @@ enum HandlerError {
 
     #[error("Failed to decode: {0}")]
     DecodeError(#[from] bincode::error::DecodeError),
-
-    // #[error("Thread join error: {0}")]
-    // ThreadJoinError(String),
 }
 
 fn main() -> Result<(), HandlerError> {
@@ -71,19 +68,18 @@ fn handle_request(mut stream: TcpStream) -> Result<(), HandlerError> {
 fn handle_message(message: Message, stream: TcpStream) -> Result<(), HandlerError> {
     let uuid = Uuid::new_v4();
     let work_dir = format!("/tmp/executions/{uuid}");
-    
+
     fs::create_dir_all(&work_dir)?;
-    
+
     let script_path = format!("{work_dir}/script.js");
     fs::write(&script_path, message.code)?;
 
     let mut child = Command::new("node")
-    .arg(&script_path)
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()?;
-
+        .arg(&script_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
 
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -101,7 +97,7 @@ fn handle_message(message: Message, stream: TcpStream) -> Result<(), HandlerErro
             }
         }
     });
-    
+
     // stderr thread
     let err_stream = Arc::clone(&shared_stream);
     let err_handle = thread::spawn(move || {
@@ -125,6 +121,8 @@ fn handle_message(message: Message, stream: TcpStream) -> Result<(), HandlerErro
 
     fs::remove_dir_all(&work_dir)?;
 
+    clean_up()?;
+
     Ok(())
 }
 
@@ -140,4 +138,12 @@ fn read_content_from_stream(stream: &mut TcpStream) -> Result<Message, HandlerEr
     let (message, _message_length): (Message, usize) =
         bincode::decode_from_slice(&message_buffer[..], config::standard())?;
     Ok(message)
+}
+
+fn clean_up() -> Result<(), HandlerError> {
+    let _ = Command::new("find")
+        .args(["/tmp", "-mindepth", "1", "-delete"])
+        .status()?;
+
+    Ok(())
 }
