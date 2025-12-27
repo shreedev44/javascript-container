@@ -1,25 +1,48 @@
 use bincode::{Decode, Encode, config};
 use std::{
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{Read, Write},
     net::{TcpListener, TcpStream},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
-    thread,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self},
 };
 use uuid::Uuid;
 
 #[derive(Encode, Decode, Debug)]
-enum MessageType {
-    Execution,
-    Stdin,
+struct ExecRequest {
+    code: Vec<u8>,
+    // args: Vec<String>,
+    // env: Vec<(String, String)>,
+    timeout_ms: u64,
 }
 
-#[derive(Encode, Decode, Debug)]
-struct Message {
-    message_type: MessageType,
-    language: String,
-    code: String,
+
+#[derive(Clone, Copy)]
+enum FrameType {
+    ExecRequest = 1,
+    Stdin       = 2,
+    Stdout      = 3,
+    Stderr      = 4,
+    Exit        = 5,
+    Error       = 6,
+}
+
+impl FrameType {
+    fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            1 => Some(Self::ExecRequest),
+            2 => Some(Self::Stdin),
+            3 => Some(Self::Stdout),
+            4 => Some(Self::Stderr),
+            5 => Some(Self::Exit),
+            6 => Some(Self::Error),
+            _ => None,
+        }
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -59,20 +82,21 @@ fn listen_to_port(port: u16) -> Result<(), HandlerError> {
 }
 
 fn handle_request(mut stream: TcpStream) -> Result<(), HandlerError> {
-    let message = read_content_from_stream(&mut stream)?;
-    handle_message(message, stream)?;
+    if let Some((_, payload)) = read_frame(&mut stream)? {
+        let (message, _) = bincode::decode_from_slice(&payload, config::standard())?;
+        handle_message(message, stream)?;
+    }
 
     Ok(())
 }
 
-fn handle_message(message: Message, stream: TcpStream) -> Result<(), HandlerError> {
+fn handle_message(request: ExecRequest, mut stream: TcpStream) -> Result<(), HandlerError> {
     let uuid = Uuid::new_v4();
     let work_dir = format!("/tmp/executions/{uuid}");
-
     fs::create_dir_all(&work_dir)?;
 
     let script_path = format!("{work_dir}/script.js");
-    fs::write(&script_path, message.code)?;
+    fs::write(&script_path, request.code)?;
 
     let mut child = Command::new("node")
         .arg(&script_path)
@@ -81,63 +105,82 @@ fn handle_message(message: Message, stream: TcpStream) -> Result<(), HandlerErro
         .stderr(Stdio::piped())
         .spawn()?;
 
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    let out_stream = stream.try_clone()?;
+    let err_stream = stream.try_clone()?;
+    let in_stream = stream.try_clone()?;
 
-    let shared_stream = Arc::new(Mutex::new(stream));
+    stream_pipe(child.stdout.take().unwrap(), out_stream, FrameType::Stdout);
+    stream_pipe(child.stderr.take().unwrap(), err_stream, FrameType::Stderr);
 
-    // stdout thread
-    let out_stream = Arc::clone(&shared_stream);
-    let out_handle = thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(l) = line {
-                let mut s = out_stream.lock().unwrap();
-                let _ = writeln!(s, "{l}");
-            }
-        }
-    });
+    let stdin = child.stdin.take().unwrap();
 
-    // stderr thread
-    let err_stream = Arc::clone(&shared_stream);
-    let err_handle = thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            if let Ok(l) = line {
-                let mut s = err_stream.lock().unwrap();
-                let _ = writeln!(s, "{l}");
-            }
-        }
+    let child_done = Arc::new(AtomicBool::new(false));
+    let done_flag = child_done.clone();
+
+    thread::spawn(move || {
+        handle_stdin(stdin, in_stream, done_flag);
     });
 
     let status = child.wait()?;
-    let _ = out_handle.join();
-    let _ = err_handle.join();
 
-    writeln!(
-        shared_stream.lock().unwrap(),
-        "Process exited with status: {status}"
-    )?;
+    child_done.store(true, Ordering::Relaxed);
 
+
+    let code = status.code().unwrap_or(-1);
+    send_frame(&mut stream, FrameType::Exit, &code.to_be_bytes())?;
     fs::remove_dir_all(&work_dir)?;
-
-    clean_up()?;
-
-    Ok(())
+    clean_up()
 }
 
-fn read_content_from_stream(stream: &mut TcpStream) -> Result<Message, HandlerError> {
-    let mut content_length_buffer = [0u8; 4];
-    stream.read_exact(&mut content_length_buffer)?;
+fn handle_stdin(
+    mut child_stdin: impl Write,
+    mut stream: TcpStream,
+    child_done: Arc<AtomicBool>,
+) {
+    while !child_done.load(Ordering::Acquire) {
+        match read_frame(&mut stream) {
+            Ok(Some((FrameType::Stdin, payload))) => {
+                if child_stdin.write_all(&payload).is_err() {
+                    break;
+                }
+                let _ = child_stdin.flush();
+            }
 
-    let content_length = u32::from_ne_bytes(content_length_buffer);
+            Ok(Some((_other, _))) => {
+                continue;
+            }
 
-    let mut message_buffer = vec![0u8; content_length as usize];
-    stream.read_exact(&mut message_buffer)?;
+            Ok(None) => {
+                break;
+            }
 
-    let (message, _message_length): (Message, usize) =
-        bincode::decode_from_slice(&message_buffer[..], config::standard())?;
-    Ok(message)
+            Err(_) => break,
+        }
+    }
+
+    drop(child_stdin);
+}
+
+fn stream_pipe(
+    mut reader: impl Read + Send + 'static,
+    mut stream: TcpStream,
+    frame_type: FrameType,
+) {
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if send_frame(&mut stream, frame_type, &buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
 }
 
 fn clean_up() -> Result<(), HandlerError> {
@@ -145,5 +188,39 @@ fn clean_up() -> Result<(), HandlerError> {
         .args(["/tmp", "-mindepth", "1", "-delete"])
         .status()?;
 
+    let _ = Command::new("find")
+        .args(["/tmp", "-mindepth", "1", "-delete"])
+        .status()?;
+
     Ok(())
+}
+
+
+fn send_frame(
+    stream: &mut TcpStream,
+    typ: FrameType,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    stream.write_all(&[typ as u8])?;
+    stream.write_all(&(payload.len() as u32).to_be_bytes())?;
+    stream.write_all(payload)?;
+    stream.flush()
+}
+
+
+fn read_frame(stream: &mut TcpStream) -> std::io::Result<Option<(FrameType, Vec<u8>)>> {
+    let mut header = [0u8; 5];
+
+    if let Err(e) = stream.read_exact(&mut header) {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Ok(None);
+        }
+        return Err(e);
+    }
+
+    let len = u32::from_be_bytes(header[1..5].try_into().unwrap());
+    let mut payload = vec![0; len as usize];
+    stream.read_exact(&mut payload)?;
+
+    Ok(Some((FrameType::from_u8(header[0]).unwrap(), payload)))
 }
