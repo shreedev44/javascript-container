@@ -10,5 +10,5 @@ docker run \
   --cpus=0.5 \
   --cap-drop=ALL \
   --security-opt no-new-privileges \
-  executor-js
+  executor-js:1.0.0
 
